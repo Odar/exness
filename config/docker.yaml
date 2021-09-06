@@ -1,0 +1,10 @@
+settingsdb:
+  addr: localhost
+  port: 54321
+  user: postgres
+  password: postgres
+  db: exness
+  migrationdir: tools/migrate/migrations/exness
+
+logger:
+  level: debug
