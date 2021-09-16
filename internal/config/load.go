@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+
 	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -44,7 +45,7 @@ func load() (*Options, error) {
 }
 
 func getFilePath() (string, error) {
-	flag.String("config", "dev.yaml", "path to config file")
+	flag.String("config", "config/dev.yaml", "path to config file")
 
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()

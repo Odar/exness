@@ -1,17 +1,14 @@
 package dto
 
-type AccountCreationRequest struct {
-}
-
 type AccountCreationResponse struct {
 	Account  *Account
 	ApiError *ApiError
 }
 
 type TransferMoneyRequest struct {
-	FromAccountID int64
-	ToAccountID   int64
-	Cents         int64
+	SenderAccountID    int64
+	RecipientAccountID int64
+	Cents              int64
 }
 
 type TransferMoneyResponse struct {

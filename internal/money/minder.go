@@ -2,7 +2,6 @@ package money
 
 import (
 	"context"
-	"database/sql"
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/jmoiron/sqlx"
@@ -19,11 +18,11 @@ func NewMinder(postgres *sqlx.DB) *minder {
 }
 
 type replenisher interface {
-	ReplenishAccount(accountID int64, money int64) error
+	ReplenishAccount(accountID int64, cents int64) error
 }
 
 type transferrer interface {
-	TransferMoney(fromAccountID int64, toAccountID int64, money int64) error
+	TransferMoney(fromAccountID int64, toAccountID int64, cents int64) error
 }
 
 type minder struct {
@@ -31,7 +30,7 @@ type minder struct {
 	builder  sq.StatementBuilderType
 }
 
-func (m *minder) ReplenishAccount(accountID int64, money int64) (err error) {
+func (m *minder) ReplenishAccount(accountID int64, cents int64) (err error) {
 	tx, err := m.postgres.BeginTxx(context.Background(), nil)
 	if err != nil {
 		return errors.Wrap(err, "can not start transaction")
@@ -48,7 +47,7 @@ func (m *minder) ReplenishAccount(accountID int64, money int64) (err error) {
 		}
 	}()
 
-	err = m.replenishAccount(tx, accountID, money)
+	err = m.replenishAccount(tx, accountID, cents)
 	if err != nil {
 		return errors.Wrap(err, "can not replenish account")
 	}
@@ -62,7 +61,7 @@ func (m *minder) ReplenishAccount(accountID int64, money int64) (err error) {
 }
 
 func (m *minder) TransferMoney(fromAccountID int64, toAccountID int64, cents int64) error {
-	tx, err := m.postgres.BeginTxx(context.Background(), &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	tx, err := m.postgres.BeginTxx(context.Background(), nil)
 	if err != nil {
 		return errors.Wrap(err, "can not start transaction")
 	}
@@ -104,21 +103,21 @@ func (m *minder) replenishAccount(tx *sqlx.Tx, accountID int64, cents int64) err
 	}
 
 	account := accounts[0]
-	if isSumOverflow(cents, account.Cents) {
+	if isSumOverflow(cents, account.Balance) {
 		return errors.New("cents will be overflowing")
 	}
 
 	transaction := models.Transaction{
-		To:    accountID,
-		Cents: cents,
-		Type:  models.ReplenishTransactionType,
+		RecipientAccountID: accountID,
+		Cents:              cents,
+		Type:               models.ReplenishTransactionType,
 	}
 	err = m.addTransaction(tx, transaction)
 	if err != nil {
 		return errors.Wrap(err, "can not add transaction")
 	}
 
-	account, err = m.addMoneyToAccount(tx, accountID, cents)
+	err = m.addMoneyToAccount(tx, accountID, account.Balance+cents)
 	if err != nil {
 		return errors.Wrap(err, "can not add cents to account")
 	}
@@ -126,8 +125,8 @@ func (m *minder) replenishAccount(tx *sqlx.Tx, accountID int64, cents int64) err
 	return nil
 }
 
-func (m *minder) transferMoney(tx *sqlx.Tx, fromAccountID int64, toAccountID int64, cents int64) error {
-	accounts, err := m.getAndLockAccounts(tx, fromAccountID, toAccountID)
+func (m *minder) transferMoney(tx *sqlx.Tx, senderAccountID int64, recipientAccountID int64, cents int64) error {
+	accounts, err := m.getAndLockAccounts(tx, senderAccountID, recipientAccountID)
 	if err != nil {
 		return errors.Wrap(err, "can not get account")
 	}
@@ -136,51 +135,50 @@ func (m *minder) transferMoney(tx *sqlx.Tx, fromAccountID int64, toAccountID int
 	}
 
 	var (
-		fromAccount *models.Account
-		toAccount   *models.Account
+		senderAccount    *models.Account
+		recipientAccount *models.Account
 	)
 	for _, account := range accounts {
-		if account.ID == fromAccountID {
-			fromAccount = account
+		if account.ID == senderAccountID {
+			senderAccount = account
 			continue
 		}
-		if account.ID == toAccountID {
-			toAccount = account
+		if account.ID == recipientAccountID {
+			recipientAccount = account
 			continue
 		}
 	}
-	if fromAccount == nil {
+	if senderAccount == nil {
 		return errors.New("can't find an account for cents withdrawal")
 	}
-	if toAccount == nil {
+	if recipientAccount == nil {
 		return errors.New("can't find an account to accrue cents")
 	}
 
-	//TODO check overflow and belowzero
-	if isSumOverflow(cents, toAccount.Cents) {
+	if isSumOverflow(cents, recipientAccount.Balance) {
 		return errors.New("cents will be overflowing")
 	}
-	if isBelowZero(fromAccountID, cents) {
+	if isBelowZero(senderAccount.Balance, cents) {
 		return errors.New("balance cannot be negative")
 	}
 
 	transaction := models.Transaction{
-		From:  fromAccountID,
-		To:    toAccountID,
-		Cents: cents,
-		Type:  models.TransferTransactionType,
+		SenderAccountID:    senderAccountID,
+		RecipientAccountID: recipientAccountID,
+		Cents:              cents,
+		Type:               models.TransferTransactionType,
 	}
 	err = m.addTransaction(tx, transaction)
 	if err != nil {
 		return errors.Wrap(err, "can not add transaction")
 	}
 
-	_, err = m.addMoneyToAccount(tx, fromAccountID, -cents)
+	err = m.addMoneyToAccount(tx, senderAccountID, senderAccount.Balance-cents)
 	if err != nil {
 		return errors.Wrap(err, "can not add cents to account")
 	}
 
-	_, err = m.addMoneyToAccount(tx, toAccountID, cents)
+	err = m.addMoneyToAccount(tx, recipientAccountID, recipientAccount.Balance+cents)
 	if err != nil {
 		return errors.Wrap(err, "can not add cents to account")
 	}
@@ -190,19 +188,19 @@ func (m *minder) transferMoney(tx *sqlx.Tx, fromAccountID int64, toAccountID int
 
 func (m *minder) getAndLockAccounts(tx *sqlx.Tx, accountIDs ...int64) ([]*models.Account, error) {
 	builder := m.builder.
-		Select("id, cents").
+		Select("id, balance").
 		From("account").
 		Where(sq.Eq{"id": accountIDs}).
 		Suffix("FOR UPDATE")
-	sql, args, err := builder.ToSql()
+	query, args, err := builder.ToSql()
 	if err != nil {
 		return nil, errors.Wrap(err, "can not build sql")
 	}
 
 	accounts := make([]*models.Account, 0)
-	err = tx.Select(&accounts, sql, args...)
+	err = tx.Select(&accounts, query, args...)
 	if err != nil {
-		return nil, errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", sql, args)
+		return nil, errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", query, args)
 	}
 
 	return accounts, nil
@@ -211,35 +209,35 @@ func (m *minder) getAndLockAccounts(tx *sqlx.Tx, accountIDs ...int64) ([]*models
 func (m *minder) addTransaction(tx *sqlx.Tx, transaction models.Transaction) error {
 	builder := m.builder.
 		Insert("transaction").
-		Columns("from_account_id", "to_account_id", "type").
-		Values(transaction.From, transaction.To, transaction.Type)
-	sql, args, err := builder.ToSql()
+		Columns("sender_account_id", "recipient_account_id", "cents", "type").
+		Values(transaction.SenderAccountID, transaction.RecipientAccountID, transaction.Cents, transaction.Type)
+	query, args, err := builder.ToSql()
 	if err != nil {
 		return errors.Wrap(err, "can not build sql")
 	}
 
-	_, err = tx.Exec(sql, args...)
+	_, err = tx.Exec(query, args...)
 	if err != nil {
-		return errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", sql, args)
+		return errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", query, args)
 	}
 
 	return nil
 }
 
-func (m *minder) addMoneyToAccount(tx *sqlx.Tx, accountID int64, cents int64) (*models.Account, error) {
+func (m *minder) addMoneyToAccount(tx *sqlx.Tx, accountID int64, newBalance int64) error {
 	builder := m.builder.
 		Update("account").
-		Set("cents = cents + ?", cents).
+		Set("balance", newBalance).
 		Where("id = ?", accountID)
-	sql, args, err := builder.ToSql()
+	query, args, err := builder.ToSql()
 	if err != nil {
-		return nil, errors.Wrap(err, "can not build sql")
+		return errors.Wrap(err, "can not build sql")
 	}
 
-	_, err = tx.Exec(sql, args...)
+	_, err = tx.Exec(query, args...)
 	if err != nil {
-		return nil, errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", sql, args)
+		return errors.Wrapf(err, "can not exec sql '%s' with args '%+v'", query, args)
 	}
 
-	return nil, nil
+	return nil
 }
